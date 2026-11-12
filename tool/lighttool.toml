@@ -1,0 +1,12 @@
+[tool]
+id = "sg.lightbus"
+label = "SG Bus"
+versionCode = 1
+versionName = "0.1.0"
+permissions = [
+    "android.permission.INTERNET",
+    "android.permission.ACCESS_COARSE_LOCATION",
+    "android.permission.ACCESS_FINE_LOCATION",
+]
+capabilities = []
+serverPackage = "com.lightos"
