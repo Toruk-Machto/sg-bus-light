@@ -16,6 +16,14 @@ android {
         manifestPlaceholders["sdkVersion"] = property("sdkVersion") as String
     }
 
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+        }
+    }
+
     lint {
         error += "RestrictedApi"
     }

@@ -10,8 +10,19 @@ import kotlin.math.cos
 import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.descriptors.PrimitiveKind
+import kotlinx.serialization.descriptors.PrimitiveSerialDescriptor
+import kotlinx.serialization.descriptors.nullable
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
+import kotlinx.serialization.json.JsonDecoder
+import kotlinx.serialization.json.JsonEncoder
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.intOrNull
 
 @Serializable
 data class BusStop(
@@ -28,12 +39,64 @@ data class NearbyStop(val stop: BusStop, val metres: Int)
 data class BusRouteStop(
     @SerialName("BusStopCode") val stopCode: String,
     @SerialName("ServiceNo") val service: String,
+    @SerialName("Direction") val direction: Int = 1,
+    @SerialName("StopSequence") val sequence: Int = 0,
+    @SerialName("Distance") val distance: Double? = null,
+    @SerialName("Operator") val operator: String = "",
+    @SerialName("WD_FirstBus") val weekdayFirst: String = "",
+    @SerialName("WD_LastBus") val weekdayLast: String = "",
+    @SerialName("SAT_FirstBus") val saturdayFirst: String = "",
+    @SerialName("SAT_LastBus") val saturdayLast: String = "",
+    @SerialName("SUN_FirstBus") val sundayFirst: String = "",
+    @SerialName("SUN_LastBus") val sundayLast: String = "",
+)
+
+@Serializable
+data class BusService(
+    @SerialName("ServiceNo") val number: String,
+    @SerialName("Direction") val direction: Int,
+    @SerialName("Operator") val operator: String = "",
+    @SerialName("Category") val category: String = "",
+    @SerialName("OriginCode") val originCode: String = "",
+    @SerialName("DestinationCode") val destinationCode: String = "",
+    @SerialName("LoopDesc") val loopDescription: String = "",
+    @SerialName("AM_Peak_Freq") val amPeak: String = "",
+    @SerialName("AM_Offpeak_Freq") val amOffpeak: String = "",
+    @SerialName("PM_Peak_Freq") val pmPeak: String = "",
+    @SerialName("PM_Offpeak_Freq") val pmOffpeak: String = "",
 )
 
 @Serializable
 data class ArrivalPrediction(
     @SerialName("EstimatedArrival") val timestamp: String = "",
-)
+    @SerialName("OriginCode") val originCode: String = "",
+    @SerialName("DestinationCode") val destinationCode: String = "",
+    @SerialName("Load") val load: String = "",
+    @SerialName("Type") val vehicleType: String = "",
+    @SerialName("Monitored") @Serializable(with = OptionalArrivalInt::class) val monitored: Int? = null,
+    @SerialName("VisitNumber") @Serializable(with = OptionalArrivalInt::class) val visitNumber: Int? = null,
+) {
+    val scheduled: Boolean get() = monitored == 0
+    val crowdingLabel: String?
+        get() = when (load) {
+            "SEA" -> "Seats"
+            "SDA" -> "Standing"
+            "LSD" -> "Limited standing"
+            else -> null
+        }
+}
+
+// DataMall can supply a number, a quoted number, or a blank for these arrival fields.
+private object OptionalArrivalInt : KSerializer<Int?> {
+    override val descriptor = PrimitiveSerialDescriptor("DataMallArrivalInt", PrimitiveKind.INT).nullable
+
+    override fun deserialize(decoder: Decoder): Int? =
+        ((decoder as JsonDecoder).decodeJsonElement() as? JsonPrimitive)?.intOrNull
+
+    override fun serialize(encoder: Encoder, value: Int?) {
+        (encoder as JsonEncoder).encodeJsonElement(value?.let(::JsonPrimitive) ?: JsonNull)
+    }
+}
 
 @Serializable
 data class LiveService(
@@ -43,7 +106,40 @@ data class LiveService(
     @SerialName("NextBus3") val third: ArrivalPrediction? = null,
 )
 
-data class ServiceArrivals(val number: String, val times: List<Instant?>)
+data class ServiceArrivals(
+    val number: String,
+    val times: List<Instant?>,
+    val predictions: List<ArrivalPrediction?> = emptyList(),
+)
+
+data class DirectBus(
+    val service: String,
+    val direction: Int,
+    val board: BusRouteStop,
+    val alight: BusRouteStop,
+)
+
+private val serviceOrder = compareBy<String> { it.takeWhile(Char::isDigit).toIntOrNull() ?: Int.MAX_VALUE }
+    .thenBy { it }
+
+internal fun directBuses(routes: List<BusRouteStop>, originCode: String, destinationCode: String): List<DirectBus> {
+    if (originCode == destinationCode) return emptyList()
+    return routes.asSequence()
+        .filter { it.stopCode == originCode || it.stopCode == destinationCode }
+        .groupBy { it.service to it.direction }
+        .mapNotNull { (identity, stops) ->
+            val (service, direction) = identity
+            val origins = stops.filter { it.stopCode == originCode }
+            val destinations = stops.filter { it.stopCode == destinationCode }
+            origins.asSequence()
+                .flatMap { board -> destinations.asSequence()
+                    .filter { it.sequence > board.sequence }
+                    .map { DirectBus(service, direction, board, it) }
+                }
+                .minByOrNull { it.alight.sequence - it.board.sequence }
+        }
+        .sortedWith(compareBy<DirectBus, String>(serviceOrder) { it.service }.thenBy { it.direction })
+}
 
 internal fun isStopCode(text: String): Boolean = text.length == 5 && text.all { it in '0'..'9' }
 
@@ -91,15 +187,18 @@ private fun distanceMetres(lat1: Double, lon1: Double, lat2: Double, lon2: Doubl
 internal fun mergeServices(routes: List<String>, live: List<LiveService>): List<ServiceArrivals> {
     val byNumber = live.groupBy { it.number }
     return (routes + byNumber.keys).filter(String::isNotBlank).distinct()
-        .sortedWith(compareBy<String> { number ->
-            number.takeWhile(Char::isDigit).toIntOrNull() ?: Int.MAX_VALUE
-        }.thenBy { it })
+        .sortedWith(serviceOrder)
         .map { number ->
             val predictions = byNumber[number].orEmpty().distinct()
                 .flatMap { listOf(it.first, it.second, it.third) }
-                .mapNotNull { prediction -> prediction?.timestamp?.let(::arrivalInstant) }
-                .sorted()
-            ServiceArrivals(number, List(3) { predictions.getOrNull(it) })
+                .filterNotNull()
+                .mapNotNull { prediction -> arrivalInstant(prediction.timestamp)?.let { it to prediction } }
+                .sortedBy { it.first }
+            ServiceArrivals(
+                number,
+                List(3) { predictions.getOrNull(it)?.first },
+                List(3) { predictions.getOrNull(it)?.second },
+            )
         }
 }
 

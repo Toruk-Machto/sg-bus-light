@@ -16,14 +16,34 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
 private val savedStopsKey = stringPreferencesKey("saved_bus_stops")
+private val pinnedServicesKey = stringPreferencesKey("pinned_bus_services")
 private val accountKey = stringPreferencesKey("encrypted_lta_account_key")
 private const val KEY_ALIAS = "sg.lightbus.datamall"
 private const val TRANSFORMATION = "AES/GCM/NoPadding"
 
+@Serializable
+data class PinnedService(val stop: BusStop, val number: String)
+
 class BusPreferences(private val preferences: DataStore<Preferences>) {
+    suspend fun pins(): List<PinnedService> = readPins(preferences.data.first())
+
+    suspend fun togglePin(pin: PinnedService): List<PinnedService> {
+        val result = preferences.edit { values ->
+            val existing = readPins(values)
+            val remaining = existing.filterNot { it.stop.code == pin.stop.code && it.number == pin.number }
+            val updated = if (remaining.size == existing.size) existing + pin else remaining
+            values[pinnedServicesKey] = Json.encodeToString(updated)
+        }
+        return readPins(result)
+    }
+
+    private fun readPins(values: Preferences): List<PinnedService> =
+        values[pinnedServicesKey]?.let { Json.decodeFromString<List<PinnedService>>(it) }.orEmpty()
+
     suspend fun favorites(): List<BusStop> = preferences.data.first()[savedStopsKey]?.let {
         Json.decodeFromString<List<BusStop>>(it)
     }.orEmpty()
