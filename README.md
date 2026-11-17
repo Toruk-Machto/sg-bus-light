@@ -10,8 +10,14 @@ In **Settings → Offline browsing**, download the directory over a connection. 
 
 ## Building
 
-This repository contains the source used by the Light Tool Library build service. The service builds the `tool` module against the Light SDK version pinned in `gradle.properties`.
+This repository contains the SG Bus tool module and the SDK patch used for the signed release. The SDK version is pinned in `gradle.properties`.
 
 To build locally, use the matching [Light SDK](https://github.com/lightphone/light-sdk) source checkout and replace its `tool` directory with the `tool` directory from this repository. Follow the SDK's Android Studio setup and build `:tool:assembleDebug` with JDK 17. Use `./gradlew -DlightSdk.abiFilters=arm64-v8a :tool:assembleRelease` for a smaller ARM64 build for the Light Phone III.
 
 Bus arrival, stop, route, and service data comes from [LTA DataMall](https://datamall.lta.gov.sg/content/datamall/en/dynamic-data.html) under the [Singapore Open Data Licence](https://datamall.lta.gov.sg/content/datamall/en/SingaporeOpenDataLicence.html).
+
+## Battery update build requirement
+
+Before building against SDK 0.2.4, apply `sdk-patches/0001-lifecycle-and-device-tests.patch` from this repository in the SDK checkout with `git apply /path/to/0001-lifecycle-and-device-tests.patch`. The patch releases screen resources when Android destroys an Activity and permits instrumentation-only test APIs. It keeps the production tool restrictions in place. Automated build services must apply this patch too to reproduce the lifecycle fix. The signed APK in Releases already includes it.
+
+See [BATTERY_UPDATE.md](BATTERY_UPDATE.md) for the changes, emulator checks and battery measurement limits.

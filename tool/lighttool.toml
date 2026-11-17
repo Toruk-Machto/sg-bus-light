@@ -1,8 +1,8 @@
 [tool]
 id = "sg.lightbus"
 label = "SG Bus"
-versionCode = 2
-versionName = "0.2.0"
+versionCode = 3
+versionName = "0.2.1"
 permissions = [
     "android.permission.INTERNET",
     "android.permission.ACCESS_COARSE_LOCATION",

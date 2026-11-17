@@ -1,0 +1,37 @@
+diff --git a/plugin/src/main/kotlin/com/thelightphone/plugin/LightSdkPlugin.kt b/plugin/src/main/kotlin/com/thelightphone/plugin/LightSdkPlugin.kt
+index 5ddfc1c..f0d726b 100644
+--- a/plugin/src/main/kotlin/com/thelightphone/plugin/LightSdkPlugin.kt
++++ b/plugin/src/main/kotlin/com/thelightphone/plugin/LightSdkPlugin.kt
+@@ -437,6 +437,8 @@ class LightSdkPlugin : Plugin<Project> {
+         if (!srcDirs.exists()) return
+ 
+         srcDirs.walkTopDown()
++            // Device test harnesses run outside the shipped tool and need instrumentation APIs.
++            .onEnter { it != srcDirs.resolve("androidTest") && it != srcDirs.resolve("test") }
+             .filter { it.isFile && it.extension == "kt" }
+             .forEach { file ->
+                 val relativePath = file.relativeTo(project.projectDir).path
+diff --git a/sdk/client/src/main/kotlin/com/thelightphone/sdk/LightActivity.kt b/sdk/client/src/main/kotlin/com/thelightphone/sdk/LightActivity.kt
+index d46a167..6132c44 100644
+--- a/sdk/client/src/main/kotlin/com/thelightphone/sdk/LightActivity.kt
++++ b/sdk/client/src/main/kotlin/com/thelightphone/sdk/LightActivity.kt
+@@ -215,6 +215,19 @@ class LightActivity internal constructor() : ComponentActivity() {
+         }
+     }
+ 
++    override fun onDestroy() {
++        // These stores belong to the individual screens, not the Activity's own store.
++        // Clear them for system destruction as well as explicit Back navigation.
++        backStack.forEach { entry ->
++            entry.screen.notifyWillHide()
++            entry.screen.destroy()
++            entry.viewModelStoreOwner.viewModelStore.clear()
++        }
++        backStack.clear()
++        currentScreen.value = null
++        super.onDestroy()
++    }
++
+     override fun onPause() {
+         super.onPause()
+         currentScreen.value?.screen?.notifyAppPause()

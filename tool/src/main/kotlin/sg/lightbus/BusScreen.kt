@@ -324,7 +324,7 @@ private fun arrivalClock(active: Boolean, stopCode: String, model: BusViewModel)
     var now by remember(stopCode) { mutableStateOf(Instant.now()) }
     LaunchedEffect(active, stopCode) {
         if (!active) return@LaunchedEffect
-        while (true) {
+        while (model.state.value.active) {
             now = Instant.now()
             model.refreshIfDue()
             delay(5_000)

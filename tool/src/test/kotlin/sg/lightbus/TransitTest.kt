@@ -8,6 +8,14 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class TransitTest {
+    @org.junit.Test fun failedRequestsBackOffAndAuthorizationWaitsForUser() {
+        kotlin.test.assertEquals(60_000L, retryDelay(java.io.IOException(), 30_000L))
+        kotlin.test.assertEquals(300_000L, retryDelay(java.io.IOException(), 240_000L))
+        kotlin.test.assertEquals(300_000L, retryDelay(java.io.IOException(), Long.MAX_VALUE))
+        kotlin.test.assertEquals(Long.MAX_VALUE, retryDelay(DataMallError("Unauthorized", 401), 30_000L))
+        kotlin.test.assertEquals(Long.MAX_VALUE, retryDelay(DataMallError("Forbidden", 403), 30_000L))
+    }
+
     @Test
     fun `a direct bus must reach the destination after boarding in the same direction`() {
         val routes = listOf(

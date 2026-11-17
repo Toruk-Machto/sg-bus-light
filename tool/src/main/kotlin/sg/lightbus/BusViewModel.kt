@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.withContext
 
 sealed interface Page {
@@ -72,8 +73,15 @@ class BusViewModel(
     private var arrivalJob: Job? = null
     private var routeJob: Job? = null
     private var directoryJob: Job? = null
+    private var offlineJob: Job? = null
+    private var resumeJob: Job? = null
+    private var pausedJobs = emptyList<Job>()
+    private var resumeCatalog = false
+    private var resumeOffline = false
     private var lastArrivalAttempt = 0L
     private var lastRouteAttempt: Long? = null
+    private var arrivalRetryDelay = 30_000L
+    private var routeRetryDelay = 60_000L
     private var loadedSearch: Page.Results? = null
     private var arrivalsPage: Page.Stop? = null
 
@@ -90,20 +98,59 @@ class BusViewModel(
                 mutableState.update { it.copy(message = "Could not read saved app settings.") }
             } finally {
                 mutableState.update { it.copy(keyReady = true, keySaved = key != null) }
+                if (state.value.active) resumeVisibleWork()
             }
         }
     }
 
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
         mutableState.update { it.copy(active = true) }
+        resumeJob?.cancel()
+        resumeJob = viewModelScope.launch {
+            pausedJobs.joinAll()
+            pausedJobs = emptyList()
+            if (state.value.active && state.value.keyReady) resumeVisibleWork()
+        }
     }
 
     override fun onScreenHide(screen: SimpleLightScreen<Unit>) {
-        mutableState.update { it.copy(active = false) }
+        pauseNetworkWork()
     }
 
     override fun onAppPause() {
+        pauseNetworkWork()
+    }
+
+    private fun pauseNetworkWork() {
         mutableState.update { it.copy(active = false) }
+        resumeJob?.cancel()
+        resumeCatalog = resumeCatalog || catalogJob?.isActive == true
+        resumeOffline = resumeOffline || offlineJob?.isActive == true
+        if (arrivalJob?.isActive == true) lastArrivalAttempt = 0
+        if (routeJob?.isActive == true) lastRouteAttempt = null
+        pausedJobs = (pausedJobs + listOfNotNull(catalogJob, arrivalJob, routeJob, directoryJob, offlineJob)).distinct()
+        pausedJobs.forEach(Job::cancel)
+    }
+
+    private fun resumeVisibleWork() {
+        if (resumeOffline) {
+            resumeOffline = false
+            downloadOfflineData()
+        }
+        val page = state.value.page
+        if (resumeCatalog) {
+            resumeCatalog = false
+            when (page) {
+                is Page.Results -> search(page.query)
+                is Page.Service -> loadService(page)
+                is Page.Direct -> loadDirect(page)
+                else -> Unit
+            }
+        }
+        if (page is Page.Stop || page is Page.Arrival) {
+            preloadStopDirectory()
+            refreshIfDue()
+        }
     }
 
     override fun onBackPressed(): Boolean {
@@ -166,6 +213,8 @@ class BusViewModel(
                 routeJob?.cancel()
                 directoryJob?.cancel()
                 lastRouteAttempt = null
+                arrivalRetryDelay = 30_000L
+                routeRetryDelay = 60_000L
                 key = value
                 mutableState.update {
                     it.copy(
@@ -265,6 +314,7 @@ class BusViewModel(
         arrivalJob?.cancel()
         arrivalJob = null
         lastArrivalAttempt = 0
+        arrivalRetryDelay = 30_000L
         val page = Page.Stop(stop, origin, serviceNumber)
         show(page)
         clearArrivals(page)
@@ -283,7 +333,10 @@ class BusViewModel(
         }
     }
 
-    fun refreshArrivals() {
+    fun refreshArrivals() = fetchArrivals(manual = true)
+
+    private fun fetchArrivals(manual: Boolean) {
+        if (!state.value.active) return
         val visiblePage = state.value.page
         val page = when (visiblePage) {
             is Page.Stop -> visiblePage
@@ -294,7 +347,7 @@ class BusViewModel(
         val elapsed = android.os.SystemClock.elapsedRealtime()
         val lastRouteRefresh = lastRouteAttempt
         if (state.value.routes == null && routeJob?.isActive != true &&
-            (lastRouteRefresh == null || elapsed - lastRouteRefresh >= 60_000L)
+            (lastRouteRefresh == null || manual || elapsed - lastRouteRefresh >= routeRetryDelay)
         ) {
             lastRouteAttempt = elapsed
             loadRoutes(accountKey)
@@ -308,11 +361,13 @@ class BusViewModel(
         arrivalJob = viewModelScope.launch {
             try {
                 val arrivals = dataMall.arrivals(page.stop.code, accountKey, page.serviceNumber)
+                arrivalRetryDelay = 30_000L
                 if (state.value.page === visiblePage) {
                     mutableState.update { it.copy(arrivals = arrivals, arrivalsAt = Instant.now()) }
                 }
             } catch (error: Exception) {
                 error.rethrowCancellation()
+                arrivalRetryDelay = retryDelay(error, arrivalRetryDelay)
                 if (state.value.page === visiblePage) {
                     mutableState.update { it.copy(arrivalError = error.display("Could not refresh arrivals.")) }
                 }
@@ -323,8 +378,10 @@ class BusViewModel(
     }
 
     fun refreshIfDue() {
-        if (android.os.SystemClock.elapsedRealtime() - lastArrivalAttempt >= 30_000L) {
-            refreshArrivals()
+        if (state.value.active && (lastArrivalAttempt == 0L ||
+            android.os.SystemClock.elapsedRealtime() - lastArrivalAttempt >= arrivalRetryDelay)
+        ) {
+            fetchArrivals(manual = false)
         }
     }
 
@@ -446,7 +503,7 @@ class BusViewModel(
             return
         }
         mutableState.update { it.copy(offlineDownloading = true, message = null) }
-        viewModelScope.launch {
+        offlineJob = viewModelScope.launch {
             try {
                 val ready = dataMall.downloadCatalogs(accountKey)
                 val stale = dataMall.hasStaleCatalogs()
@@ -509,8 +566,10 @@ class BusViewModel(
                     }
                 }
                 mutableState.update { it.copy(routes = routes) }
+                routeRetryDelay = 60_000L
             } catch (error: Exception) {
                 error.rethrowCancellation()
+                routeRetryDelay = retryDelay(error, routeRetryDelay)
                 mutableState.update {
                     it.copy(routeError = error.display("The full service list is unavailable."))
                 }

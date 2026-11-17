@@ -3,8 +3,9 @@ package sg.lightbus
 import android.util.AtomicFile
 import java.io.File
 import java.io.IOException
-import java.net.URL
-import javax.net.ssl.HttpsURLConnection
+import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -12,6 +13,13 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
@@ -26,6 +34,10 @@ private val dataJson = Json {
 }
 
 class DataMallError(message: String, val httpStatus: Int? = null) : IOException(message)
+
+internal fun retryDelay(error: Exception, previous: Long): Long =
+    if ((error as? DataMallError)?.httpStatus in setOf(401, 403)) Long.MAX_VALUE
+    else previous.coerceAtMost(150_000L) * 2
 
 internal fun dataMallHttpError(path: String, status: Int): DataMallError {
     val endpoint = path.substringBefore('?').substringAfterLast('/')
@@ -61,7 +73,13 @@ internal fun parseArrivals(body: String, code: String): List<LiveService> {
     return response.services
 }
 
-class DataMall(private val directory: File) {
+class DataMall(
+    private val directory: File,
+    private val client: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(8, TimeUnit.SECONDS).readTimeout(12, TimeUnit.SECONDS)
+        .callTimeout(25, TimeUnit.SECONDS)
+        .followRedirects(false).followSslRedirects(false).retryOnConnectionFailure(false).build(),
+) {
     private val stopsFile = AtomicFile(File(directory, "bus-stops.json"))
     private val routeStopsFile = AtomicFile(File(directory, "bus-route-stops.json"))
     private val servicesFile = AtomicFile(File(directory, "bus-services.json"))
@@ -181,37 +199,52 @@ class DataMall(private val directory: File) {
     private fun readServices(): Catalog<List<BusService>>? =
         servicesInMemory ?: readCache<List<BusService>>(servicesFile).also { servicesInMemory = it }
 
-    private suspend inline fun <reified T> pages(endpoint: String, key: String): List<T> {
-        val all = mutableListOf<T>()
-        for (page in 0 until 300) {
-            kotlin.coroutines.coroutineContext.ensureActive()
-            val batch = dataJson.decodeFromString<DataPage<T>>(
-                get("$endpoint?\$skip=${page * PAGE_SIZE}", key),
-            ).value
-            all.addAll(batch)
-            if (batch.size < PAGE_SIZE) {
-                if (all.isEmpty()) throw DataMallError("LTA returned an empty stop or route directory.")
-                return all
+    private suspend inline fun <reified T> pages(endpoint: String, key: String): List<T> =
+        withTimeoutOrNull(180_000L) {
+            val all = mutableListOf<T>()
+            for (page in 0 until 300) {
+                kotlin.coroutines.coroutineContext.ensureActive()
+                val batch = dataJson.decodeFromString<DataPage<T>>(
+                    get("$endpoint?\$skip=${page * PAGE_SIZE}", key),
+                ).value
+                all.addAll(batch)
+                if (batch.size < PAGE_SIZE) {
+                    if (all.isEmpty()) throw DataMallError("LTA returned an empty stop or route directory.")
+                    return@withTimeoutOrNull all
+                }
+                delay(200)
             }
-            delay(200)
-        }
-        throw DataMallError("LTA returned an incomplete directory. Please try again.")
-    }
+            throw DataMallError("LTA returned an incomplete directory. Please try again.")
+    } ?: throw DataMallError("The directory download timed out. Try again on a stronger connection.")
 
-    private fun get(path: String, key: String): String {
+    private suspend fun get(path: String, key: String): String {
         if (key.isBlank()) throw DataMallError("Enter your LTA DataMall key first.")
-        val connection = URL(BASE_URL + path).openConnection() as HttpsURLConnection
-        return try {
-            connection.instanceFollowRedirects = false
-            connection.connectTimeout = 8_000
-            connection.readTimeout = 12_000
-            connection.setRequestProperty("AccountKey", key)
-            connection.setRequestProperty("Accept", "application/json")
-            val status = connection.responseCode
-            if (status != 200) throw dataMallHttpError(path, status)
-            connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-        } finally {
-            connection.disconnect()
+        val request = Request.Builder().url(BASE_URL + path)
+            .header("AccountKey", key).header("Accept", "application/json").build()
+        return suspendCancellableCoroutine { continuation ->
+            val call = client.newCall(request)
+            continuation.invokeOnCancellation { call.cancel() }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, error: IOException) {
+                    continuation.resumeWithException(error)
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    try {
+                        val body = response.use {
+                            if (!it.isSuccessful) throw dataMallHttpError(path, it.code)
+                            val source = it.body.source()
+                            if (source.request(16L * 1024 * 1024 + 1)) {
+                                throw DataMallError("LTA returned a response that was too large.")
+                            }
+                            source.readUtf8()
+                        }
+                        continuation.resume(body)
+                    } catch (error: Exception) {
+                        continuation.resumeWithException(error)
+                    }
+                }
+            })
         }
     }
 
